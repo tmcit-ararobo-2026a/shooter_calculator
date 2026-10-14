@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(shooter_calculator)
+project(shooter_calculator LANGUAGES C CXX)
 
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
@@ -11,7 +11,19 @@ endif()
 
 # Find ROS 2 dependencies
 find_package(ament_cmake REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+find_package(builtin_interfaces REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/AimTarget.msg" "msg/ShotSolution.msg"
+  DEPENDENCIES geometry_msgs std_msgs builtin_interfaces)
+
+option(BUILD_RUNTIME_NODES "Build shooter calculation runtime nodes" ON)
+if(BUILD_RUNTIME_NODES)
 find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
+find_package(nlohmann_json REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
@@ -31,6 +43,7 @@ ament_target_dependencies(shooter_calculator_lib
 # Shooter Calculator Node
 add_executable(shooter_calculator_node src/shooter_calculator_node.cpp)
 ament_target_dependencies(shooter_calculator_node
+  rcl_interfaces
   rclcpp
   std_msgs
   geometry_msgs
@@ -39,13 +52,21 @@ ament_target_dependencies(shooter_calculator_node
   tf2_ros
   tf2_geometry_msgs
 )
-target_link_libraries(shooter_calculator_node shooter_calculator_lib)
+rosidl_get_typesupport_target(cpp_typesupport ${PROJECT_NAME} "rosidl_typesupport_cpp")
+target_link_libraries(shooter_calculator_node shooter_calculator_lib
+  "${cpp_typesupport}" nlohmann_json::nlohmann_json)
 
 # Install
 install(TARGETS
   shooter_calculator_node
   DESTINATION lib/${PROJECT_NAME}
 )
+install(TARGETS shooter_calculator_lib EXPORT shooter_calculator_targets
+  ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
+ament_export_targets(shooter_calculator_targets HAS_LIBRARY_TARGET)
+ament_export_dependencies(rclcpp geometry_msgs)
+
+endif()
 
 install(DIRECTORY include/
   DESTINATION include
@@ -56,4 +77,12 @@ install(DIRECTORY launch config
   OPTIONAL
 )
 
+if(BUILD_TESTING AND BUILD_RUNTIME_NODES AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/shot_solution_test.py")
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(shot_solution_test test/shot_solution_test.py
+    ENV SHOOTER_EXECUTABLE=$<TARGET_FILE:shooter_calculator_node>
+    TIMEOUT 60)
+endif()
+ament_export_dependencies(rosidl_default_runtime)
 ament_package()

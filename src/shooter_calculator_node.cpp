@@ -1,295 +1,367 @@
-#include "shooter_calculator/shooter_calculator.hpp"
+// Copyright 2026 tmcit-ararobo-2026a
+// SPDX-License-Identifier: Apache-2.0
 #include <rclcpp/rclcpp.hpp>
-#include <geometry_msgs/msg/transform_stamped.hpp>
-#include <std_msgs/msg/bool.hpp>
-#include <std_msgs/msg/float32.hpp>
-#include <visualization_msgs/msg/marker.hpp>
-#include <visualization_msgs/msg/marker_array.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Vector3.h>
+#include <nlohmann/json.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <chrono>
 #include <cmath>
+#include <fstream>
 #include <limits>
+#include <set>
+#include <stdexcept>
+#include <vector>
 
-namespace shooter_calculator
-{
+#include "shooter_calculator/shooter_calculator.hpp"
+#include "shooter_calculator/msg/aim_target.hpp"
+#include "shooter_calculator/msg/shot_solution.hpp"
 
-class ShooterCalculatorNode : public rclcpp::Node
-{
+namespace shooter_calculator {
+/** @brief Typed aiming and calibrated belt conversion; no direct actuator publishers. */
+class ShooterCalculatorNode : public rclcpp::Node {
 public:
-  ShooterCalculatorNode(const rclcpp::NodeOptions & options)
-  : Node("shooter_calculator", options),
-    calculator_(std::make_unique<ShooterCalculator>())
-  {
-    // ==========================================
-    // パラメータの宣言（ここで各種設定値を定義しています）
-    // ==========================================
-    
-    // ターゲット（バケツ）のTFフレーム名
-    this->declare_parameter("target_frame", "moving_bucket");
-    this->declare_parameter("target_frame_fallback", "moving_bucket");
-    
-    // ロボット自身の基準フレーム名
-    this->declare_parameter("robot_frame", "base_link");
-    
-    // 発射角度（度）: 実測データに合わせたデフォルト値
-    this->declare_parameter("launch_angle_deg", 50.0);
-    
-    // 雑巾（弾）の質量 [kg]: シミュレーションの物理計算で使用
-    this->declare_parameter("cloth_mass_kg", 0.12);
-    
-    // 【空気抵抗パラメータ 1】受風面積 [m^2]
-    // ※実際の面積より小さく（0.01等に）設定し、空気抵抗による急ブレーキを防いでいます
-    this->declare_parameter("cloth_area_m2", 0.01);
-    
-    // 【空気抵抗パラメータ 2】空気抵抗係数
-    // ※数値を小さくすることで、遠くまで届くように調整しています
-    this->declare_parameter("drag_coefficient", 0.1);
-    this->declare_parameter("enable_real_output", false);
-    this->declare_parameter("auto_initialize_belt", false);
-    this->declare_parameter("belt_speed_command_max_mps", 1.0);
-
-    // TFバッファとリスナーの初期化
-    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-
-    // RViz用のマーカー配信パブリッシャー
-    pub_trajectory_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-      "~/trajectory_markers", 10);
-    belt_speed_pub_ = this->create_publisher<std_msgs::msg::Float32>("/belt/speed_ratio", 10);
-    belt_init_pub_ = this->create_publisher<std_msgs::msg::Bool>("/belt/init", 10);
-
-    // 0.1秒（100ミリ秒）ごとに計算と可視化を実行するタイマー
-    timer_ = this->create_wall_timer(
-      std::chrono::milliseconds(100),
-      std::bind(&ShooterCalculatorNode::calculateAndVisualize, this));
-
-    RCLCPP_INFO(this->get_logger(), "ShooterCalculator initialized");
+  using Clock = std::chrono::steady_clock;
+  /** @brief Configure an explicitly approved physical model; missing calibration remains invalid. */
+  ShooterCalculatorNode() : Node("shooter_calculator") {
+    rcl_interfaces::msg::ParameterDescriptor descriptor;
+    descriptor.read_only = true;
+    const auto file = declare_parameter<std::string>("calibration_file", "", descriptor);
+    target_timeout_s_ = declare_parameter<double>("target_timeout_s", 0.15, descriptor);
+    pose_timeout_s_ = declare_parameter<double>("pose_timeout_s", 0.5, descriptor);
+    if (!std::isfinite(target_timeout_s_) || target_timeout_s_ <= 0 ||
+      !std::isfinite(pose_timeout_s_) || pose_timeout_s_ <= 0)
+    {
+      throw std::invalid_argument("Target/pose deadlines must be positive");
+    }
+    if (!file.empty()) {
+      load_calibration(file);
+    }
+    buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    listener_ = std::make_unique<tf2_ros::TransformListener>(*buffer_);
+    solution_publisher_ = create_publisher<msg::ShotSolution>("/shooter/solution", rclcpp::QoS(1).durability_volatile());
+    trajectory_publisher_ = create_publisher<visualization_msgs::msg::MarkerArray>("~/trajectory_markers", 10);
+    target_subscription_ = create_subscription<msg::AimTarget>("/auto_mode/aim_target",
+      rclcpp::QoS(1).durability_volatile(),
+      [this](msg::AimTarget::ConstSharedPtr target) { accept_target(*target); });
+    timer_ = create_wall_timer(std::chrono::milliseconds(20), [this]() { calculate(); });
   }
-
 private:
-  std::unique_ptr<ShooterCalculator> calculator_;
-  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_trajectory_;
-  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr belt_speed_pub_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr belt_init_pub_;
+  /** @brief Read finite profile numbers without clamping missing/invalid values. */
+  double number(const nlohmann::json & config, const char * key) const {
+    const double value = config.at(key).get<double>();
+    if (!std::isfinite(value)) {
+      throw std::invalid_argument("Calibration values must be finite");
+    }
+    return value;
+  }
+  /** @brief Require physical units and monotonic measured release-to-belt pairs. */
+  void load_calibration(const std::string & file) {
+    std::ifstream stream(file);
+    if (!stream) {
+      throw std::invalid_argument("Cannot open calibration profile");
+    }
+    nlohmann::json config;
+    stream >> config;
+    if (config.at("schema_version").get<int>() != 1) {
+      throw std::invalid_argument("Unsupported calibration schema");
+    }
+    if (!config.at("approved").get<bool>()) {
+      return;
+    }
+    calibration_id_ = config.at("calibration_id").get<std::string>();
+    map_frame_ = config.at("map_frame").get<std::string>();
+    robot_frame_ = config.at("robot_frame").get<std::string>();
+    const auto offset = config.at("shooter_offset_m").get<std::vector<double>>();
+    if (calibration_id_.empty() || map_frame_.empty() || robot_frame_.empty() ||
+      map_frame_ == robot_frame_ || offset.size() != 3)
+    {
+      throw std::invalid_argument("Calibration ID, frames and measured shooter offset are required");
+    }
+    for (const auto value : offset) {
+      if (!std::isfinite(value)) {
+        throw std::invalid_argument("Shooter offset must be finite");
+      }
+    }
+    offset_ = tf2::Vector3(offset[0], offset[1], offset[2]);
+    angle_deg_ = number(config, "launch_angle_deg");
+    mass_kg_ = number(config, "cloth_mass_kg");
+    area_m2_ = number(config, "cloth_area_m2");
+    drag_ = number(config, "drag_coefficient");
+    height_tolerance_m_ = number(config, "max_height_error_m");
+    if (angle_deg_ <= 0 || angle_deg_ >= 90 || mass_kg_ < 0.01 || area_m2_ < 0 ||
+      drag_ < 0 || height_tolerance_m_ <= 0 ||
+      !std::isfinite(0.5 * 1.225 * drag_ * area_m2_ / mass_kg_))
+    {
+      throw std::invalid_argument("Calibration outside the supported ballistic model domain");
+    }
+    if (config.value("allow_moving_targets", false)) {
+      throw std::invalid_argument("Moving target compensation contract is not yet implemented");
+    }
+    for (const auto & pair : config.at("calibration_pairs")) {
+      if (!pair.is_array() || pair.size() != 2) {
+        throw std::invalid_argument("Calibration pairs must be [initial_speed_m_s,belt_speed_m_s]");
+      }
+      const double initial = pair[0].get<double>();
+      const double belt = pair[1].get<double>();
+      if (!std::isfinite(initial) || !std::isfinite(belt) || initial < 1 || initial > 20 || belt == 0 ||
+        std::abs(belt) > std::numeric_limits<float>::max()) {
+        throw std::invalid_argument("Calibration speeds are invalid or outside solver range [1,20]");
+      }
+      if (!calibration_pairs_.empty()) {
+        const auto & previous = calibration_pairs_.back();
+        if (initial <= previous.first || std::abs(belt) <= std::abs(previous.second) ||
+          (belt > 0) != (previous.second > 0))
+        {
+          throw std::invalid_argument("Calibration must increase initial speed and belt magnitude with one sign");
+        }
+      }
+      calibration_pairs_.emplace_back(initial, belt);
+    }
+    if (calibration_pairs_.size() < 2) {
+      throw std::invalid_argument("At least two approved calibration pairs are required");
+    }
+    calibrated_ = true;
+  }
+  /** @brief Admit complete current targets and reject stale sessions/generations/stamps. */
+  void accept_target(const msg::AimTarget & target) {
+    if (target.producer_session == 0 || target.generation == 0 || target.header.stamp.sec < 0 ||
+      target.header.stamp.nanosec >= 1000000000U || retired_sessions_.count(target.producer_session) != 0)
+    {
+      return;
+    }
+    const auto stamp_ns = rclcpp::Time(target.header.stamp).nanoseconds();
+    const double age_s = static_cast<double>(now().nanoseconds() - stamp_ns) * 1e-9;
+    if (stamp_ns <= 0 || age_s < 0 || age_s >= target_timeout_s_) {
+      return;
+    }
+    if (target.producer_session == target_.producer_session) {
+      if (target.generation < target_.generation || stamp_ns <= rclcpp::Time(target_.header.stamp).nanoseconds()) {
+        return;
+      }
+    } else if (target_.producer_session != 0) {
+      retired_sessions_.insert(target_.producer_session);
+    }
+    target_ = target;
+    have_target_ = true;
+    target_deadline_ = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+      std::chrono::duration<double>(target_timeout_s_ - age_s));
+  }
+  /** @brief Verify actual model height at range; solver fallback alone is never a valid result. */
+  bool height_at_range(double speed, double range, double & height,
+    std::vector<geometry_msgs::msg::Point> & trajectory) const
+  {
+    const double angle_rad = angle_deg_ * std::acos(-1.0) / 180;
+    double x = 0, z = 0, vx = speed * std::cos(angle_rad), vz = speed * std::sin(angle_rad);
+    const double drag_factor = 0.5 * 1.225 * drag_ * area_m2_ / mass_kg_;
+    constexpr double TIME_STEP_S = 0.005;
+    for (int step = 0; step < 1000; ++step) {
+      const double previous_x = x, previous_z = z;
+      const double magnitude = std::hypot(vx, vz);
+      vx -= drag_factor * magnitude * vx * TIME_STEP_S;
+      vz += (-calculator_.GRAVITY - drag_factor * magnitude * vz) * TIME_STEP_S;
+      x += vx * TIME_STEP_S;
+      z += vz * TIME_STEP_S;
+      if (!std::isfinite(x) || !std::isfinite(z) || vx <= 0) {
+        return false;
+      }
+      geometry_msgs::msg::Point point;
+      point.x = x;
+      point.z = z;
+      trajectory.push_back(point);
+      if (x >= range) {
+        const double ratio = (range - previous_x) / (x - previous_x);
+        height = previous_z + ratio * (z - previous_z);
+        return std::isfinite(height);
+      }
+    }
+    return false;
+  }
+  /** @brief Interpolate only inside the explicitly measured calibration interval. */
+  bool belt_speed(double initial_speed, double & belt) const {
+    if (initial_speed < calibration_pairs_.front().first || initial_speed > calibration_pairs_.back().first) {
+      return false;
+    }
+    for (std::size_t pair_index = 1; pair_index < calibration_pairs_.size(); ++pair_index) {
+      const auto & first = calibration_pairs_[pair_index - 1];
+      const auto & second = calibration_pairs_[pair_index];
+      if (initial_speed <= second.first) {
+        const double ratio = (initial_speed - first.first) / (second.first - first.first);
+        belt = first.second + ratio * (second.second - first.second);
+        return std::isfinite(belt);
+      }
+    }
+    return false;
+  }
+  /** @brief Build a fresh invalid-or-calibrated solution and discard every old valid output. */
+  void calculate() {
+    msg::ShotSolution solution;
+    solution.header.stamp = now();
+    solution.header.frame_id = map_frame_;
+    solution.producer_session = target_.producer_session;
+    solution.generation = target_.generation;
+    solution.target_id = target_.target_id;
+    solution.calibration_id = calibration_id_;
+    solution.reason = "No current AimTarget";
+    const auto current_ns = now().nanoseconds();
+    if (last_ros_now_ns_ > 0 && current_ns < last_ros_now_ns_) {
+      have_target_ = false;
+      last_pose_stamp_ns_ = 0;
+    }
+    last_ros_now_ns_ = current_ns;
+    const double target_age_s = static_cast<double>(current_ns - rclcpp::Time(target_.header.stamp).nanoseconds()) * 1e-9;
+    std::vector<geometry_msgs::msg::Point> trajectory;
+    tf2::Vector3 origin;
+    double direction_x = 0, direction_y = 0;
+    try {
+      if (!have_target_ || Clock::now() >= target_deadline_ || target_age_s < 0 || target_age_s >= target_timeout_s_) {
+        throw std::runtime_error("AimTarget missing or expired");
+      }
+      if (!target_.valid) {
+        throw std::runtime_error("AimTarget invalid");
+      }
+      if (!calibrated_) {
+        throw std::runtime_error("Calibration missing or unapproved");
+      }
+      if (target_.target_id == 0 || target_.target_id > 7 || target_.header.frame_id != map_frame_) {
+        throw std::runtime_error("Unsupported target ID/frame");
+      }
+      if (target_.target_id == 7) {
+        throw std::runtime_error("Moving target compensation is not yet approved");
+      }
+      for (const auto value : {target_.position.x, target_.position.y, target_.position.z,
+          target_.velocity_m_s.x, target_.velocity_m_s.y, target_.velocity_m_s.z, target_.confidence})
+      {
+        if (!std::isfinite(value)) {
+          throw std::runtime_error("Target contains nonfinite fields");
+        }
+      }
+      for (const auto value : target_.position_covariance) {
+        if (!std::isfinite(value)) {
+          throw std::runtime_error("Target covariance contains nonfinite values");
+        }
+      }
+      for (std::size_t axis = 0; axis < 3; ++axis) {
+        if (target_.position_covariance[axis * 3 + axis] < 0) {
+          throw std::runtime_error("Target covariance diagonal is negative");
+        }
+      }
+      if (target_.predicted || target_.confidence < 0 || target_.confidence > 1 ||
+        target_.velocity_m_s.x != 0 || target_.velocity_m_s.y != 0 || target_.velocity_m_s.z != 0)
+      {
+        throw std::runtime_error("Static solution requires a valid stationary target");
+      }
+      const auto pose = buffer_->lookupTransform(map_frame_, robot_frame_, tf2::TimePointZero);
+      const double pose_age_s = (now() - rclcpp::Time(pose.header.stamp)).seconds();
+      const auto pose_stamp_ns = rclcpp::Time(pose.header.stamp).nanoseconds();
+      if (!std::isfinite(pose_age_s) || pose_age_s < 0 || pose_age_s >= pose_timeout_s_) {
+        throw std::runtime_error("Robot pose expired");
+      }
+      if (pose_stamp_ns > last_pose_stamp_ns_) {
+        last_pose_stamp_ns_ = pose_stamp_ns;
+        pose_deadline_ = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+          std::chrono::duration<double>(pose_timeout_s_ - pose_age_s));
+      }
+      if (Clock::now() >= pose_deadline_) {
+        throw std::runtime_error("Robot pose no longer advances");
+      }
+      const auto & rotation = pose.transform.rotation;
+      const double norm = rotation.x * rotation.x + rotation.y * rotation.y +
+                          rotation.z * rotation.z + rotation.w * rotation.w;
+      if (!std::isfinite(norm) || std::abs(norm - 1) >= 1e-3 ||
+        std::abs(rotation.x) > 1e-6 || std::abs(rotation.y) > 1e-6) {
+        throw std::runtime_error("Robot pose quaternion invalid");
+      }
+      const tf2::Quaternion quaternion(rotation.x, rotation.y, rotation.z, rotation.w);
+      const auto & position = pose.transform.translation;
+      origin = tf2::Vector3(position.x, position.y, position.z) + tf2::quatRotate(quaternion, offset_);
+      const double delta_x = target_.position.x - origin.x();
+      const double delta_y = target_.position.y - origin.y();
+      const double height_delta = target_.position.z - origin.z();
+      const double range = std::hypot(delta_x, delta_y);
+      if (!std::isfinite(range) || range <= 0 || !std::isfinite(height_delta)) {
+        throw std::runtime_error("Target geometry is unreachable or invalid");
+      }
+      const double initial_speed = calculator_.getRequiredVelocityWithDrag(
+        range, height_delta, angle_deg_, mass_kg_, area_m2_, drag_);
+      double simulated_height = 0, belt = 0;
+      if (!std::isfinite(initial_speed) || !height_at_range(initial_speed, range, simulated_height, trajectory) ||
+        std::abs(simulated_height - height_delta) > height_tolerance_m_)
+      {
+        throw std::runtime_error("Target unreachable in the configured ballistic model");
+      }
+      if (!belt_speed(initial_speed, belt)) {
+        throw std::runtime_error("Required initial speed outside measured calibration range");
+      }
+      solution.initial_speed_m_s = initial_speed;
+      solution.belt_speed_m_s = belt;
+      solution.in_calibration_range = true;
+      solution.valid = true;
+      solution.reason = "Valid static calibrated model solution";
+      direction_x = delta_x / range;
+      direction_y = delta_y / range;
+    } catch (const std::exception & error) {
+      solution.reason = error.what();
+    }
+    solution_publisher_->publish(solution);
+    if (trajectory_publisher_->get_subscription_count() > 0) {
+      visualization_msgs::msg::MarkerArray markers;
+      visualization_msgs::msg::Marker line;
+      line.header = solution.header;
+      line.ns = "shooter";
+      line.id = 2;
+      line.action = visualization_msgs::msg::Marker::DELETE;
+      if (solution.valid) {
+        line.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        line.action = visualization_msgs::msg::Marker::ADD;
+        line.pose.orientation.w = 1;
+        line.scale.x = 0.025;
+        line.color.g = 1;
+        line.color.a = 1;
+        for (const auto & sample : trajectory) {
+          geometry_msgs::msg::Point point;
+          point.x = origin.x() + direction_x * sample.x;
+          point.y = origin.y() + direction_y * sample.x;
+          point.z = origin.z() + sample.z;
+          line.points.push_back(point);
+        }
+      }
+      markers.markers.push_back(line);
+      trajectory_publisher_->publish(markers);
+    }
+  }
+  ShooterCalculator calculator_;
+  bool calibrated_{}, have_target_{};
+  std::string calibration_id_, map_frame_{"map"}, robot_frame_{"base_link"};
+  double angle_deg_{}, mass_kg_{}, area_m2_{}, drag_{}, height_tolerance_m_{};
+  double target_timeout_s_{}, pose_timeout_s_{};
+  tf2::Vector3 offset_;
+  msg::AimTarget target_{};
+  int64_t last_ros_now_ns_{}, last_pose_stamp_ns_{};
+  Clock::time_point target_deadline_{}, pose_deadline_{};
+  std::vector<std::pair<double, double>> calibration_pairs_;
+  std::set<uint64_t> retired_sessions_;
+  std::unique_ptr<tf2_ros::Buffer> buffer_;
+  std::unique_ptr<tf2_ros::TransformListener> listener_;
+  rclcpp::Publisher<msg::ShotSolution>::SharedPtr solution_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr trajectory_publisher_;
+  rclcpp::Subscription<msg::AimTarget>::SharedPtr target_subscription_;
   rclcpp::TimerBase::SharedPtr timer_;
-
-  geometry_msgs::msg::TransformStamped lookupTargetTransform()
-  {
-    const auto target_frame = this->get_parameter("target_frame").as_string();
-    const auto fallback_target_frame = this->get_parameter("target_frame_fallback").as_string();
-
-    try {
-      return tf_buffer_->lookupTransform("map", target_frame, rclcpp::Time());
-    } catch (const tf2::TransformException &) {
-      if (!fallback_target_frame.empty() && fallback_target_frame != target_frame) {
-        try {
-          return tf_buffer_->lookupTransform("map", fallback_target_frame, rclcpp::Time());
-        } catch (const tf2::TransformException & ex) {
-          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Could not resolve target frame '%s' or '%s': %s",
-            target_frame.c_str(), fallback_target_frame.c_str(), ex.what());
-          throw;
-        }
-      }
-      throw;
-    }
-  }
-
-  void calculateAndVisualize()
-  {
-    try {
-      // TFから目標とロボットの位置を取得
-      geometry_msgs::msg::TransformStamped transform_mb = lookupTargetTransform();
-      const auto robot_frame = this->get_parameter("robot_frame").as_string();
-      geometry_msgs::msg::TransformStamped transform_base =
-        tf_buffer_->lookupTransform("map", robot_frame, rclcpp::Time());
-
-      double target_x = transform_mb.transform.translation.x;
-      double target_y = transform_mb.transform.translation.y;
-      double target_z = transform_mb.transform.translation.z;
-
-      double robot_x = transform_base.transform.translation.x;
-      double robot_y = transform_base.transform.translation.y;
-
-      // ==========================================
-      // 発射口の位置オフセット設定
-      // ==========================================
-      // ロボットの中心(base_link)から見て、発射口がどこにあるかのオフセット [m]
-      const double shooter_x = robot_x + 0.2; // 前方に20cm
-      const double shooter_y = robot_y;       // 左右のズレなし
-      const double shooter_z = 0.3;           // 床面から高さ30cm
-      
-      // 距離の計算
-      const double dx_to_target = target_x - shooter_x;
-      const double dy_to_target = target_y - shooter_y;
-      const double horizontal_target_distance = std::sqrt(dx_to_target * dx_to_target + 
-                                                          dy_to_target * dy_to_target);
-      const double target_height_delta = target_z - shooter_z;
-
-      // パラメータの取得
-      const double launch_angle_deg = this->get_parameter("launch_angle_deg").as_double();
-      const double cloth_mass = this->get_parameter("cloth_mass_kg").as_double();
-      const double cloth_area = this->get_parameter("cloth_area_m2").as_double();
-      const double drag_coefficient = this->get_parameter("drag_coefficient").as_double();
-      const double angle_rad = launch_angle_deg * M_PI / 180.0;
-
-      // 各実測出力の軌道を目標位置までシミュレーションし、最も近い出力を選ぶ
-      int required_output = 1;
-      double required_velocity = calculator_->getReleaseVelocityFromOutputLevel(required_output);
-      const bool enable_real_output = this->get_parameter("enable_real_output").as_bool();
-      const bool auto_initialize_belt = this->get_parameter("auto_initialize_belt").as_bool();
-      const double belt_speed_max = this->get_parameter("belt_speed_command_max_mps").as_double();
-      constexpr double erpm_per_belt_velocity = -46000.0;
-      constexpr double motor_pole_pairs = 14.0;
-      double required_belt_velocity = 0.0;
-      double required_erpm = 0.0;
-      double required_motor_rpm = 0.0;
-      double closest_target_distance = std::numeric_limits<double>::max();
-      std::vector<geometry_msgs::msg::Point> target_trajectory;
-
-      if (horizontal_target_distance > 0.0) {
-        const double ux = dx_to_target / horizontal_target_distance;
-        const double uy = dy_to_target / horizontal_target_distance;
-        const double air_density = 1.225; // 空気密度 [kg/m^3]
-        const double dt = 0.02;           // シミュレーションの刻み時間 [秒]
-
-        for (int output = 1; output <= 10; ++output) {
-          const double output_velocity = calculator_->getReleaseVelocityFromOutputLevel(output);
-          double x = shooter_x;
-          double y = shooter_y;
-          double z = shooter_z;
-          double vx = output_velocity * std::cos(angle_rad) * ux;
-          double vy = output_velocity * std::cos(angle_rad) * uy;
-          double vz = output_velocity * std::sin(angle_rad);
-          double candidate_closest_distance = std::numeric_limits<double>::max();
-          std::vector<geometry_msgs::msg::Point> candidate_trajectory;
-
-          for (int i = 0; i < 200; ++i) {
-            const double speed = std::sqrt(vx * vx + vy * vy + vz * vz);
-            if (speed < 1e-6) break;
-
-            const double drag_factor = 0.5 * air_density * drag_coefficient * cloth_area / std::max(cloth_mass, 0.05);
-            const double ax = -drag_factor * speed * vx;
-            const double ay = -drag_factor * speed * vy;
-            const double az = -calculator_->GRAVITY - drag_factor * speed * vz;
-
-            vx += ax * dt;
-            vy += ay * dt;
-            vz += az * dt;
-            x += vx * dt;
-            y += vy * dt;
-            z += vz * dt;
-
-            geometry_msgs::msg::Point p;
-            p.x = x; p.y = y; p.z = z;
-            const double distance_to_target = std::sqrt(
-              (x - target_x) * (x - target_x) +
-              (y - target_y) * (y - target_y) +
-              (z - target_z) * (z - target_z));
-            candidate_closest_distance = std::min(candidate_closest_distance, distance_to_target);
-            if (z < 0.0) break;
-            candidate_trajectory.push_back(p);
-          }
-
-          if (candidate_closest_distance < closest_target_distance) {
-            closest_target_distance = candidate_closest_distance;
-            required_output = output;
-            required_velocity = output_velocity;
-            target_trajectory = candidate_trajectory;
-          }
-        }
-      }
-
-      required_belt_velocity = std::clamp(
-        static_cast<double>(required_output) / 10.0 * belt_speed_max, 0.0, 1.0);
-      required_erpm = required_belt_velocity * erpm_per_belt_velocity;
-      required_motor_rpm = required_erpm / motor_pole_pairs;
-
-      if (enable_real_output) {
-        std_msgs::msg::Float32 belt_speed_message;
-        belt_speed_message.data = static_cast<float>(required_belt_velocity);
-        belt_speed_pub_->publish(belt_speed_message);
-
-        if (auto_initialize_belt) {
-          std_msgs::msg::Bool belt_init_message;
-          belt_init_message.data = true;
-          belt_init_pub_->publish(belt_init_message);
-        }
-      }
-
-      // ==========================================
-      // RViz マーカー作成（可視化の設定）
-      // ==========================================
-      visualization_msgs::msg::MarkerArray marker_array;
-
-      // 推奨出力で計算した軌跡を1本だけ表示
-      visualization_msgs::msg::Marker trajectory_marker;
-      trajectory_marker.header.frame_id = "map";
-      trajectory_marker.header.stamp = this->now();
-      trajectory_marker.ns = "shooter";
-      trajectory_marker.id = 2;
-      trajectory_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
-      trajectory_marker.action = visualization_msgs::msg::Marker::ADD;
-      trajectory_marker.scale.x = 0.025;
-      trajectory_marker.color.r = 0.0; trajectory_marker.color.g = 1.0; trajectory_marker.color.b = 0.0; trajectory_marker.color.a = 0.95;
-      for (const auto & p : target_trajectory) {
-        trajectory_marker.points.push_back(p);
-      }
-      marker_array.markers.push_back(trajectory_marker);
-
-      // 4: 文字情報（距離・推奨出力・予測速度の表示）
-      visualization_msgs::msg::Marker info_marker;
-      info_marker.header.frame_id = "map";
-      info_marker.header.stamp = this->now();
-      info_marker.ns = "shooter";
-      info_marker.id = 4;
-      info_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-      info_marker.action = visualization_msgs::msg::Marker::ADD;
-      info_marker.pose.position.x = robot_x + 1.0;
-      info_marker.pose.position.y = robot_y;
-      info_marker.pose.position.z = 1.5;
-      info_marker.scale.z = 0.1;
-      info_marker.color.r = 1.0; info_marker.color.g = 1.0; info_marker.color.b = 1.0; info_marker.color.a = 1.0;
-      info_marker.text = "Distance: " + std::to_string(horizontal_target_distance) + " m\n" +
-                         "Recommended belt_vel: " + std::to_string(required_belt_velocity) + " m/s\n" +
-                         "Motor RPM: " + std::to_string(required_motor_rpm) + "\n" +
-                         "Predicted release velocity: " + std::to_string(required_velocity) + " m/s";
-      marker_array.markers.push_back(info_marker);
-
-      pub_trajectory_->publish(marker_array);
-
-      // ==========================================
-      // ターミナルへのログ出力（1秒に1回）
-      // ==========================================
-      RCLCPP_INFO_THROTTLE(
-        this->get_logger(),
-        *this->get_clock(),
-        1000,
-        "Target: %.2f m, Height: %.2f m | Predicted Vel: %.2f m/s -> [ belt_vel: %.2f m/s, RPM: %.0f ]",
-        horizontal_target_distance,
-        target_height_delta,
-        required_velocity,
-        required_belt_velocity,
-        required_motor_rpm
-      );
-
-    } catch (const tf2::TransformException & ex) {
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "Transform error: %s", ex.what());
-    }
-  }
 };
+}  // namespace shooter_calculator
 
-} // namespace shooter_calculator
-
-int main(int argc, char * argv[])
-{
+/** @brief Run the typed solver, which never publishes belt initialization or direct commands. */
+int main(int argc, char ** argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<shooter_calculator::ShooterCalculatorNode>(
-    rclcpp::NodeOptions()));
+  try {
+    rclcpp::spin(std::make_shared<shooter_calculator::ShooterCalculatorNode>());
+  } catch (const std::exception & error) {
+    RCLCPP_FATAL(rclcpp::get_logger("shooter_calculator"), "%s", error.what());
+    rclcpp::shutdown();
+    return 1;
+  }
   rclcpp::shutdown();
   return 0;
 }
