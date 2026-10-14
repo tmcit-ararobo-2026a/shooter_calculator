@@ -244,3 +244,10 @@ shooter_calculator
 
 `-DBUILD_RUNTIME_NODES=OFF` で型生成を実行ノードから分離できる。
 初速とベルト速度の変換・校正範囲・無効解処理はT13で実装し、校正未確定の間は実機受入を保留する。
+
+## AimTarget・ShotSolution（T02b）
+
+AimTargetは対象位置・速度・最終観測時刻・valid・session/世代を保持する。
+ShotSolutionは射出初速とベルト速度、valid・校正範囲・校正IDを別々に保持する。
+T02bは型定義まで。型付き入出力の接続・射出口姿勢・速度校正・invalid配信はT13の残作業。
+旧0〜1比率を物理速度として新型へ流用しない。
