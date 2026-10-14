@@ -102,9 +102,11 @@ RVizのAdd → By topicから`/shooter_calculator/trajectory_markers`のMarkerAr
 
 ## 6. 検証
 
+以下の試験にはローカル管理の`test/`ファイルが必要です。
+
 ```bash
 colcon test --packages-select shooter_calculator
 colcon test-result --verbose
 ```
 
-合成した固定対象を使う試験の詳細は[射出解の検証記録](docs/shot_solution_verification.md)を参照してください。移動対象補償・実測校正・実射出の受入は別途必要です。
+合成した固定対象を使う試験はローカルのテストファイルがある場合だけ登録します。移動対象補償・実測校正・実射出の受入は別途必要です。

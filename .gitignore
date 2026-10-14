@@ -14,3 +14,7 @@ Thumbs.db
 
 __pycache__/
 .pytest_cache/
+
+# Local documentation and tests
+docs/
+test/

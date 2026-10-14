@@ -77,7 +77,8 @@ install(DIRECTORY launch config
   OPTIONAL
 )
 
-if(BUILD_TESTING AND BUILD_RUNTIME_NODES)
+if(BUILD_TESTING AND BUILD_RUNTIME_NODES AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/shot_solution_test.py")
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(shot_solution_test test/shot_solution_test.py
     ENV SHOOTER_EXECUTABLE=$<TARGET_FILE:shooter_calculator_node>
