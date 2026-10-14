@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(shooter_calculator)
+project(shooter_calculator LANGUAGES C CXX)
 
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
@@ -11,6 +11,10 @@ endif()
 
 # Find ROS 2 dependencies
 find_package(ament_cmake REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+find_package(builtin_interfaces REQUIRED)
+option(BUILD_RUNTIME_NODES "Build shooter calculation runtime nodes" ON)
+if(BUILD_RUNTIME_NODES)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -47,6 +51,8 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+endif()
+
 install(DIRECTORY include/
   DESTINATION include
 )
@@ -56,4 +62,5 @@ install(DIRECTORY launch config
   OPTIONAL
 )
 
+ament_export_dependencies(rosidl_default_runtime)
 ament_package()
