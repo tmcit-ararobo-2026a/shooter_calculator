@@ -13,3 +13,11 @@ ROS公式schema検査・launch Python構文: 成功。旧belt/initとspeed_ratio
 localhost専用domain、合成校正とgeometryだけを使用。実射出・物理速度変換・移動対象補償・実機・HIL: 未実施。
 実測profileがないため既定はapproved=false。到達不能・範囲外・未承認はvalid=false。速度0だけを射出禁止・物理停止と扱わない。
 旧LUTは保持し、belt校正に流用しない。実機校正・モデル誤差・移動対象補償の受入は未完了。
+
+## インストール後のノード起動修正
+
+2026-10-14 Asia/Tokyo、fix/3-installed-runtime、50b9f62からのCMake差分。
+managerの実launch初回は失敗／CTest8。libshooter_calculator_lib.soがinstallされず、起動終了コード127。
+ライブラリinstall/exportとrclcpp/geometry_msgs exportを追加。Humble colcon build --packages-select shooter_calculator --build-base /tmp/manager-v1/build --install-base /tmp/manager-v1/installで成功／終了コード0。
+install/setup.bashをsourceしたmanagerのsimulation_integration_testで実射出計算ノードが起動し、固定対象ShotSolutionとloopback belt値を確認、成功／終了コード0。
+ログ `/tmp/manager-v1/install-repair-build.log`、manager-simulation-retry.log。旧LUT・実機profileは変更なし。実射出・校正・実機は未実施。

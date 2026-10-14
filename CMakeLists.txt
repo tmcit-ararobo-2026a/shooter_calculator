@@ -61,6 +61,10 @@ install(TARGETS
   shooter_calculator_node
   DESTINATION lib/${PROJECT_NAME}
 )
+install(TARGETS shooter_calculator_lib EXPORT shooter_calculator_targets
+  ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
+ament_export_targets(shooter_calculator_targets HAS_LIBRARY_TARGET)
+ament_export_dependencies(rclcpp geometry_msgs)
 
 endif()
 
