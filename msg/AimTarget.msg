@@ -1,0 +1,11 @@
+std_msgs/Header header
+uint64 producer_session
+uint64 generation
+uint8 target_id
+bool valid
+bool predicted
+builtin_interfaces/Time last_observation_stamp
+geometry_msgs/Point position
+geometry_msgs/Vector3 velocity_m_s
+float64[9] position_covariance
+float64 confidence

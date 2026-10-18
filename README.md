@@ -1,87 +1,79 @@
 # shooter_calculator
 
-ROS 2 で moving_bucket をターゲットとし、雑巾を射出するための軌道予測と可視化ノードです。
+目標位置から雑巾の射出初速を計算し、予測軌道を可視化するROS 2パッケージです。
 
-このパッケージは、PWM による理論計算ではなく、ベルト直動式射出機構の「リリース時終速度」を基準にした実測データベースを使う設計です。ROS からはベルト速度指令 [m/s] を送り、VESC 側で rpm 指令へ変換します。軌道計算では、雑巾がベルトから離れる瞬間の release velocity [m/s] を使います。
+ベルト直動式射出機構のリリース時終速度を軌道計算に使い、実測校正からベルト線速度へ変換します。射出初速とベルト速度は別の物理量として扱います。静止対象の計算に対応し、移動対象の発射時補償は未対応です。
 
 ---
 
 ## 1. 起動方法
 
+ROS 2 Humbleを使用します。
+
 ```bash
 cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
-colcon build --packages-select shooter_calculator
+rosdep install --from-paths src/shooter_calculator --ignore-src -y --rosdistro humble
+colcon build --symlink-install --packages-select shooter_calculator
 source install/setup.bash
-ros2 launch shooter_calculator shooter_calculator.launch.py
+ros2 launch shooter_calculator shooter_calculator.launch.py calibration_file:=/absolute/path/calibration.json
 ```
 
-ダミー環境の固定バケツを目標にする場合は、固定バケツの TF を指定します。
+既定の[config/calibration.json](config/calibration.json)は未承認のテンプレートです。承認済みの校正ファイルを指定するまで有効な射出解を出しません。bag再生時は`use_sim_time:=true`を追加します。
 
-```bash
-ros2 launch shooter_calculator shooter_calculator.launch.py \
-	target_frame:=fixed_target_fixed_bucket_1
-```
+入力・配信トピック:
 
-使用できる固定バケツの TF は次のとおりです。
+| 方向 | トピック | 型 | 内容 |
+| :--- | :--- | :--- | :--- |
+| 入力 | `/auto_mode/aim_target` | `shooter_calculator/msg/AimTarget` | 目標位置・観測時刻・session・世代・有効性 |
+| 出力 | `/shooter/solution` | `shooter_calculator/msg/ShotSolution` | 射出初速・ベルト速度・校正ID・有効性・理由 |
+| 出力 | `/shooter_calculator/trajectory_markers` | `visualization_msgs/msg/MarkerArray` | 予測軌道 |
 
-- `fixed_target_fixed_bucket_1`
-- `fixed_target_fixed_bucket_2`
-- `fixed_target_fixed_bucket_3`
-
-配信トピック:
-
-- /shooter_calculator/trajectory_markers
-
-RViz では Add -> By topic から MarkerArray を選択して表示します。
-
-LiDAR のダミー環境と一緒に使う場合は、先に次のリポジトリを起動します。
-
-```bash
-ros2 launch lidar_perception_system test_dummy.launch.py
-```
-
-その後、このパッケージを起動します。固定バケツを使う場合は、目標 TF を指定します。
+型のみをビルドする場合は`--cmake-args -DBUILD_RUNTIME_NODES=OFF`を指定します。
 
 ---
 
-## 2. 必須 TF
+## 2. 必須TFと入力条件
 
-起動前に次の TF が存在していることを確認してください。
+校正で指定する`map_frame → robot_frame`（通常は`map → base_link`）のTFが必要です。目標位置は`AimTarget`から受け取り、目標TFの代用は行いません。
 
-- map -> base_link
-- map -> moving_bucket または指定した固定バケツ TF
-
-どちらかがない場合、lookupTransform に失敗して射撃計算ができません。
+現在の軌道モデルは水平なロボット姿勢を前提とします。入力の時刻・session・世代、受信からの単調期限、TFの進行と鮮度を検査し、古い入力やTFで有効な解を維持しません。移動対象や予測だけの目標は無効解を返します。
 
 ---
 
 ## 3. 計算モデル
 
-このノードは次の順で計算を行います。
+1. `AimTarget`の目標位置と、TFからロボットの姿勢を取得します。
+2. 校正済みの射出口オフセットをロボット姿勢でmapへ変換します。
+3. 射出口から目標までの水平距離と高さ差を計算します。
+4. 射出角度・雑巾の質量・面積・抵抗係数を使い、抗力付きモデルで必要初速を求めます。
+5. 距離に対する到達高さを再評価し、許容誤差と校正範囲を検査します。
+6. 実測の初速→ベルト速度ペアを補間し、射出解と予測軌道を配信します。
 
-1. map 上の moving_bucket の位置を取得する
-2. map 上の base_link の位置を取得する
-3. ロボットの発射口位置と目標までの距離を算出する
-4. 距離から必要な出力レベルを算出する
-5. 出力レベルから release velocity を引く
-6. その速度を使って軌道を可視化する
-
-射出の前提は、ベルト直動が放出する瞬間の最高速度が雑巾の初速になるということです。ベルトへの速度指令値と雑巾の release velocity は同じ値とは限らないため、実験データで対応付けます。
+校正範囲外の値をクリップして有効解にはしません。未校正、入力断、不正値、TF断、到達不能、範囲外では`valid=false`と理由を公開します。
 
 ---
 
-## 4. 実測データベースの考え方
+## 4. 実測データベースと校正
 
-LUT は PWM ではなく、実験時のモーター出力と release velocity の対応表として扱います。実機制御時には、出力レベルをベルト速度指令または実測速度へ対応付けます。
+校正ファイルは次の情報を持ちます。
 
-- 出力レベル: 実験データ上のモーター出力
-- release_velocity: ベルト直動から離れた瞬間の射出速度 [m/s]
-- flight_distance: その速度で到達する推定飛距離 [m]
+| 項目 | 内容 |
+| :--- | :--- |
+| `schema_version` / `approved` | `1` / `true` |
+| `calibration_id` | 校正の識別子 |
+| `map_frame` / `robot_frame` | 計算に使う座標系 |
+| `shooter_offset_m` | ロボット座標系の射出口位置 `[x,y,z]` [m] |
+| `launch_angle_deg` | 射出角度 [deg]。対応範囲は0度より大きく90度未満 |
+| `cloth_mass_kg` / `cloth_area_m2` / `drag_coefficient` | 雑巾の質量・面積・抵抗係数 |
+| `max_height_error_m` | 目標距離での高さ誤差の許容値 [m] |
+| `calibration_pairs` | `[initial_speed_m_s, belt_speed_m_s]`の実測ペア |
 
-実機のデータを入れるときは、この形式に合わせて LUT を更新します。
+質量は0.01kg以上、初速は1〜20m/sに対応します。校正ペアは2組以上を用意し、初速とベルト速度の絶対値を単調に増加させます。ベルト速度は同じ非ゼロ符号を持つ必要があります。測定した範囲内だけで補間します。
 
-現在コードに入っている実測値は、出力 1〜10、射出角度 50 deg の次の対応です。
+### 既存LUTの参考データ
+
+コード内には、出力1〜10・射出角度50度の実験データも残っています。出力レベルはPWMや物理速度そのものではありません。このLUTはベルト線速度の校正には使用しません。
 
 | 出力 | release velocity [m/s] | flight distance [m] |
 | ---: | ---: | ---: |
@@ -96,146 +88,25 @@ LUT は PWM ではなく、実験時のモーター出力と release velocity �
 | 9 | 9.42 | 3.833333333 |
 | 10 | 10.84666667 | 3.966666667 |
 
-高さと滞空時間も元データには含まれますが、現在の選択処理では release velocity と軌道シミュレーションを使用します。実測値が増えた場合は、この表と `initializeLUT()` を更新してください。
+実際の計算には、校正ファイルの物理速度ペアとモデルを使います。実機の射出校正・精度確認は未完了です。
 
 ---
 
-## 5. 目標位置と着弾予測
+## 5. RVizでの表示
 
-ノードは目標位置を map 基準で見て、次のように距離を計算します。
+RVizのAdd → By topicから`/shooter_calculator/trajectory_markers`のMarkerArrayを追加します。有効解では予測軌道を線で表示し、無効解では軌道を消去します。`/shooter/solution`で初速・ベルト速度・有効性・理由を確認してください。
 
-- dx = target_x - (robot_x + 0.2)
-- dy = target_y - robot_y
-- horizontal_distance = sqrt(dx^2 + dy^2)
-
-そして、目標の高さ差、射出角度、雑巾の質量、面積、抵抗係数を考慮して、出力 1〜10 の軌道をシミュレーションします。目標位置に最も近づく出力を 1 つ選び、その軌道だけを緑線で描画します。目標位置への強制補正は行いません。
+このノードは計算結果だけを配信し、アクチュエータ指令やベルト初期化は送信しません。無効解の速度0は、実際の射出禁止や物理停止を確認した値ではありません。
 
 ---
 
-## 6. RViz で何を描くか
+## 6. 検証
 
-- 緑の線: 選択された出力の予測軌道 1 本
-- 白文字: 目標距離 / 推奨 belt_vel / モーター RPM / 予測 release velocity
-
-通常起動ではモーターへ指令を送信しません。`enable_real_output:=true` の場合だけ、計算した `belt_vel` を `/belt/speed_ratio` へ送ります。表示される `Recommended belt_vel` とモーター RPM は計算上の推奨値であり、`Predicted release velocity` は実測 LUT に基づく予測値です。
-
-## 7. 実機へ速度指令を送る場合
-
-通常起動では実機へ何も送りません。`robot-port` を起動した状態で、次のように明示的に有効化した場合だけ `/belt/speed_ratio` へ速度指令を送ります。
+以下の試験にはローカル管理の`test/`ファイルが必要です。
 
 ```bash
-ros2 launch shooter_calculator shooter_calculator.launch.py \
-	enable_real_output:=true \
-	auto_initialize_belt:=true
+colcon test --packages-select shooter_calculator
+colcon test-result --verbose
 ```
 
-この機能が送るのはベルト速度指令だけです。`/belt/throw` は自動送信しないため、射出は別途確認してから実行します。
-
-```bash
-ros2 topic pub --once /belt/throw std_msgs/msg/Bool "{data: true}"
-```
-
-送信先は `robot-port` の次のトピックです。
-
-- `/belt/speed_ratio`: ベルト速度指令 [m/s]
-- `/belt/init`: ベルト初期化
-- `/belt/throw`: 射出開始
-
-現在の変換は、実測出力 1〜10 を `0.1〜1.0 m/s` に仮対応させています。実機で使う前に、`belt_vel` と実測 release velocity の対応を校正し、`belt_speed_command_max_mps` を確認してください。速度指令を有効にしても、物理的な安全確認なしに射出しないでください。
-
-`enable_real_output:=true` にしても、雑巾を勝手に射出することはありません。計算ノードが送信するのは速度指令だけです。実際に射出するには、`robot-port` が起動している状態で、利用者が `/belt/throw` に `true` を明示的に送る必要があります。
-
-予測だけを行う場合は、次の通常起動を使用してください。
-
-```bash
-ros2 launch shooter_calculator shooter_calculator.launch.py
-```
-
----
-
-## 8. パラメータ
-
-launch ファイルで以下を調整します。
-
-- launch_angle_deg: 発射角度 [deg]
-- cloth_mass_kg: 雑巾の質量 [kg]
-- cloth_area_m2: 受風面積 [m^2]
-- drag_coefficient: 空気抵抗係数
-- enable_real_output: 実機への速度指令を有効化。既定値は false
-- auto_initialize_belt: `/belt/init` を自動送信。既定値は false
-- belt_speed_command_max_mps: 出力 10 に対応させる最大速度 [m/s]
-
----
-
-## 9. 運用時の確認ポイント
-
-- map -> base_link が出ている
-- map -> moving_bucket が出ている
-- TF の座標系が map 基準である
-- target_frame が指定した目標 TF に一致している
-- ROS のベルト速度指令が [m/s] であることを確認している
-- 実測したモーター出力 / ベルト速度 / release velocity を LUT に反映している
-
----
-
-## 10. 重要な注意点
-
-このノードは理論式だけで動いているわけではなく、実機計測ベースの LUT を使う設計です。実際の軌道の正確さは、次の更新で大きく変わります。
-
-- 実際のベルト速度指令と VESC の rpm 変換値
-- 実測の release velocity
-- 実機での射出角度
-- 雑巾の質量と面積
-
----
-
-## 11. 現在のステータス
-
-現時点の実装は、静止または動く TF ターゲットに対して、実測 LUT の出力 1〜10 を比較し、目標に最も近い 1 本の軌道を表示します。ターゲットの移動予測や実機へのモーター指令は、このパッケージには含まれていません。
-
----
-
-## 12. 関連リポジトリ
-
-今回のロボコンのベルト直動、エアシリンダー、ROS 2 通信、シミュレーション、設計資料は、次のリポジトリに分かれています。
-
-- [gn10-mainboard](https://github.com/tmcit-ararobo-2026a/gn10-mainboard): メイン基板。ベルト速度指令、VESC 初期化、エアシリンダー用ソレノイドを制御
-- [vesc-hub](https://github.com/tmcit-ararobo-2026a/vesc-hub): VESC とベルト直動の制御。速度比から rpm への変換、エンコーダーによる実速度計算
-- [robot-port](https://github.com/tmcit-ararobo-2026a/robot-port): ROS 2 からメイン基板へ CAN 指令を送るノード。ベルト・エアシリンダーのトピックを提供
-- [LiDAR-Perception-System](https://github.com/ta9ma12/LiDAR-Perception-System): LiDAR の実機・ダミー点群、固定バケツ・移動バケツの認識、`map` 基準の目標 TF、RViz2 設定を提供
-- [system-design](https://github.com/tmcit-ararobo-2026a/system-design): VESC、BLDC-NEO、エア射出を含む配線・システム構成資料
-- [robot-sim](https://github.com/tmcit-ararobo-2026a/robot-sim): Isaac Sim 2025 を使ったロボットシミュレーション
-
-ベルト直動のデータフローは次のとおりです。
-
-```text
-/belt/speed_ratio [m/s]
-	|
-	v
-robot-port
-	|
-	v
-gn10-mainboard: belt_vel [m/s]
-	|
-	v
-vesc-hub: target_rpm = belt_vel * -46000
-	|
-	v
-ベルトの実速度 -> 雑巾の release velocity -> 軌道計算
-```
-
-LiDAR ダミー環境とのデータフローは次のとおりです。
-
-```text
-LiDAR-Perception-System/test_dummy.launch.py
-	|
-	+-> map -> base_link
-	+-> map -> moving_bucket
-	+-> map -> fixed_target_fixed_bucket_1/2/3
-	|
-	v
-shooter_calculator
-	|
-	v
-目標に最も近い出力の予測軌道を MarkerArray で表示
-```
+合成した固定対象を使う試験はローカルのテストファイルがある場合だけ登録します。移動対象補償・実測校正・実射出の受入は別途必要です。
